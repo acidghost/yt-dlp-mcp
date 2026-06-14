@@ -11,7 +11,7 @@ ARG BUILD_COMMIT=unknown
 RUN just version="${BUILD_VERSION}" commit_sha="${BUILD_COMMIT}" build \
     && mv build/yt-dlp-mcp-linux-* /usr/local/bin/yt-dlp-mcp
 
-FROM python:3.14-slim@sha256:c845af9399020c7e562969a13689e929074a10fd057acd1b1fad06a2fb068e97
+FROM python:3.14-slim@sha256:44dd04494ee8f3b538294360e7c4b3acb87c8268e4d0a4828a6500b1eff50061
 COPY --from=denoland/deno@sha256:ddaad47cbbbbd856d73bd0d50074a0e308c51671d83442eebb15f1039dd4a822 /usr/bin/deno /usr/bin/deno
 RUN python3 -m pip install -U "yt-dlp[default]" \
  && groupadd --gid 1000 ytdlp \
