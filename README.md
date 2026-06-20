@@ -31,7 +31,7 @@ Download auto-generated subtitles and return normalized plain text by default.
 }
 ```
 
-`lang` defaults to `en`, and `format` defaults to `text`. Set `format` to `timestamped_text` to return compact `[HH:MM:SS] text` lines for summarization, chapter extraction, or creating a timestamped table of contents. Manual subtitles are not requested; this uses `--write-auto-subs`.
+`lang` defaults to `en`, and `format` defaults to `text`. Set `format` to `timestamped_text` to return compact `[HH:MM:SS] text` lines for summarization, chapter extraction, or creating a timestamped table of contents. Subtitle text is returned as MCP text content; structured content contains only `lang`, `format`, and `bytes` metadata. Manual subtitles are not requested; this uses `--write-auto-subs`.
 
 ## Server
 

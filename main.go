@@ -76,6 +76,12 @@ type DownloadSubtitlesResult struct {
 	Format string `json:"format"`
 }
 
+type DownloadSubtitlesMetadata struct {
+	Lang   string `json:"lang"`
+	Format string `json:"format"`
+	Bytes  int    `json:"bytes"`
+}
+
 type ytdlp struct {
 	defaultTimeout time.Duration
 	maxTimeout     time.Duration
@@ -232,7 +238,7 @@ func registerTools(s *mcpserver.MCPServer, y *ytdlp) {
 	s.AddTool(mcp.NewTool("download_subtitles",
 		mcp.WithDescription("Download YouTube auto subtitles with yt-dlp and return merged text or compact timestamped text."),
 		mcp.WithInputSchema[DownloadSubtitlesInput](),
-		mcp.WithOutputSchema[DownloadSubtitlesResult](),
+		mcp.WithOutputSchema[DownloadSubtitlesMetadata](),
 	), func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 		var in DownloadSubtitlesInput
 		if err := req.BindArguments(&in); err != nil {
@@ -252,14 +258,18 @@ func resultOrToolError[T any](res T, err error) (*mcp.CallToolResult, error) {
 	return mcp.NewToolResultStructuredOnly(res), nil
 }
 
-// subtitleResultOrToolError returns full subtitle data only in structuredContent.
-// The compact content fallback avoids doubling large subtitle responses.
+// subtitleResultOrToolError returns subtitle text as the primary MCP content and
+// keeps structuredContent to metadata to avoid doubling large responses.
 func subtitleResultOrToolError(res DownloadSubtitlesResult, err error) (*mcp.CallToolResult, error) {
 	if err != nil {
 		return mcp.NewToolResultError(err.Error()), nil
 	}
-	fallback := fmt.Sprintf("Downloaded %s subtitles for %s (%d bytes).", res.Format, res.Lang, len(res.Text))
-	return mcp.NewToolResultStructured(res, fallback), nil
+	metadata := DownloadSubtitlesMetadata{
+		Lang:   res.Lang,
+		Format: res.Format,
+		Bytes:  len(res.Text),
+	}
+	return mcp.NewToolResultStructured(metadata, res.Text), nil
 }
 
 // searchVideos searches YouTube for videos matching the given query using

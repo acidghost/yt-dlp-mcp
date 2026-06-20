@@ -52,7 +52,7 @@ chapter
 	}
 }
 
-func TestSubtitleResultDoesNotDuplicatePayloadInFallback(t *testing.T) {
+func TestSubtitleResultReturnsTranscriptInContentAndMetadataInStructuredContent(t *testing.T) {
 	payload := strings.Repeat("WEBVTT\n", 100)
 	result, err := subtitleResultOrToolError(DownloadSubtitlesResult{
 		Text:   payload,
@@ -71,10 +71,18 @@ func TestSubtitleResultDoesNotDuplicatePayloadInFallback(t *testing.T) {
 	}
 	text, ok := result.Content[0].(mcp.TextContent)
 	if !ok {
-		t.Fatalf("fallback content has type %T, want mcp.TextContent", result.Content[0])
+		t.Fatalf("content has type %T, want mcp.TextContent", result.Content[0])
 	}
-	if strings.Contains(text.Text, "WEBVTT") {
-		t.Fatalf("fallback content duplicated subtitle payload: %q", text.Text)
+	if text.Text != payload {
+		t.Fatalf("content text mismatch\nwant: %q\n got: %q", payload, text.Text)
+	}
+
+	metadata, ok := result.StructuredContent.(DownloadSubtitlesMetadata)
+	if !ok {
+		t.Fatalf("structured content has type %T, want DownloadSubtitlesMetadata", result.StructuredContent)
+	}
+	if metadata.Lang != "it" || metadata.Format != subtitleFormatTimestampedText || metadata.Bytes != len(payload) {
+		t.Fatalf("structured metadata mismatch: %+v", metadata)
 	}
 }
 
