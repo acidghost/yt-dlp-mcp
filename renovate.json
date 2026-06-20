@@ -12,7 +12,9 @@
   "customManagers": [
     {
       "customType": "regex",
-      "fileMatch": ["^justfile$"],
+      "managerFilePatterns": [
+        "/^justfile$/"
+      ],
       "matchStrings": ["--python-version (?<currentValue>\\S+)"],
       "depNameTemplate": "python",
       "datasourceTemplate": "docker"
