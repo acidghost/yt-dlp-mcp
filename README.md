@@ -65,7 +65,7 @@ docker run --rm -p 3000:3000 yt-dlp-mcp
 
 The runtime image is based on `python:3.14-slim`, installs `yt-dlp[default]`, and copies `deno` for yt-dlp's JavaScript token handling.
 
-Published images include max-level provenance, an SBOM, and a keyless cosign signature.
+Published images include max-level provenance, an SBOM, and a keyless cosign signature. Nightly release tarballs include `SHA256SUMS` and GitHub artifact attestations.
 
 Verify a published image:
 
@@ -73,4 +73,11 @@ Verify a published image:
 cosign verify ghcr.io/<owner>/<repo>:latest \
   --certificate-identity-regexp 'https://github.com/<owner>/<repo>/.github/workflows/publish-image.yaml@.*' \
   --certificate-oidc-issuer https://token.actions.githubusercontent.com
+```
+
+Verify a downloaded nightly tarball:
+
+```sh
+sha256sum -c SHA256SUMS
+gh attestation verify yt-dlp-mcp-linux-amd64.tar.gz --repo <owner>/<repo>
 ```
