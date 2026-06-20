@@ -1,0 +1,49 @@
+# .dockerignore — keep the build context to exactly what the Dockerfile uses.
+#
+# The Dockerfile references only: go.mod, go.sum, vendor/, main.go, justfile,
+# requirements.txt (and the Dockerfile itself). Everything else below is
+# excluded so it never reaches the daemon or risks landing in a layer via a
+# future broader `COPY`.
+#
+# Note: build/ is created fresh inside the builder stage (justfile's
+# `build-dir` recipe), so the host build/ (e.g. the ~10M darwin binary) is
+# excluded.
+
+# --- VCS, CI, planning metadata ---
+.git
+.gitignore
+.github
+.plans
+
+# --- Local build outputs & coverage ---
+build
+*.out
+*.test
+coverage.*
+*.coverprofile
+profile.cov
+
+# --- Cross-platform / stray binaries ---
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+
+# --- Docs, config, tooling not needed at image build time ---
+*.md
+UNLICENSE
+renovate.json
+requirements.in
+mise.toml
+.golangci.yaml
+
+# --- Editor / environment / secrets ---
+.env
+.env.*
+.idea
+.vscode
+
+# --- Go workspace (this repo uses go.mod, not a workspace) ---
+go.work
+go.work.sum
