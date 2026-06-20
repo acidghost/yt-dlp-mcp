@@ -1,0 +1,9 @@
+# yt-dlp runtime dependencies installed into the published image.
+#
+# This is the input spec; the lockfile is requirements.txt (exact versions +
+# sha256 hashes, used by `pip install --require-hashes`). Regenerate it with:
+#
+#     just update-requirements
+#
+# Renovate keeps requirements.txt current via the pip_requirements manager.
+yt-dlp[default]==2026.6.9
