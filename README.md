@@ -20,17 +20,18 @@ Returns structured results with title, URL, id, duration, uploader, and upload d
 
 ### `download_subtitles`
 
-Download auto-generated subtitles in `json3` format and return normalized plain text.
+Download auto-generated subtitles and return normalized plain text by default.
 
 ```json
 {
   "url": "https://www.youtube.com/watch?v=...",
   "lang": "en",
+  "format": "text",
   "timeout_ms": 60000
 }
 ```
 
-`lang` defaults to `en`. Manual subtitles are not requested; this uses `--write-auto-subs`.
+`lang` defaults to `en`, and `format` defaults to `text`. Set `format` to `vtt` to return timestamped WebVTT cues, which are useful for prompts such as creating a timestamped table of contents. Manual subtitles are not requested; this uses `--write-auto-subs`.
 
 ## Server
 

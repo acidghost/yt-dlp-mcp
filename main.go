@@ -65,12 +65,14 @@ type VideoResult struct {
 type DownloadSubtitlesInput struct {
 	URL       string `json:"url" jsonschema:"required"`
 	Lang      string `json:"lang,omitempty"`
+	Format    string `json:"format,omitempty" jsonschema:"Output format: text (default) returns merged plain text; vtt returns WebVTT cues with timestamps."`
 	TimeoutMS int64  `json:"timeout_ms,omitempty"`
 }
 
 type DownloadSubtitlesResult struct {
-	Text string `json:"text"`
-	Lang string `json:"lang"`
+	Text   string `json:"text"`
+	Lang   string `json:"lang"`
+	Format string `json:"format"`
 }
 
 type ytdlp struct {
@@ -122,6 +124,9 @@ const (
 	defaultSearchLimit = 5
 	maxSearchLimit     = 20
 	maxQueryLength     = 300
+
+	subtitleFormatText = "text"
+	subtitleFormatVTT  = "vtt"
 )
 
 func main() {
@@ -223,7 +228,7 @@ func registerTools(s *mcpserver.MCPServer, y *ytdlp) {
 	})
 
 	s.AddTool(mcp.NewTool("download_subtitles",
-		mcp.WithDescription("Download YouTube auto subtitles with yt-dlp and return plain text."),
+		mcp.WithDescription("Download YouTube auto subtitles with yt-dlp and return merged plain text or timestamped WebVTT."),
 		mcp.WithInputSchema[DownloadSubtitlesInput](),
 		mcp.WithOutputSchema[DownloadSubtitlesResult](),
 	), func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
@@ -276,8 +281,8 @@ func (y *ytdlp) searchVideos(ctx context.Context, in SearchVideosInput) (SearchV
 	return SearchVideosResult{Results: videos}, nil
 }
 
-// downloadSubtitles downloads auto-generated subtitles for the given video
-// URL in the requested language and returns the extracted plain text.
+// downloadSubtitles downloads auto-generated subtitles for the given video URL
+// in the requested language and returns the requested output format.
 func (y *ytdlp) downloadSubtitles(ctx context.Context, in DownloadSubtitlesInput) (DownloadSubtitlesResult, error) {
 	rawURL := strings.TrimSpace(in.URL)
 	if err := validateHTTPURL(rawURL); err != nil {
@@ -290,6 +295,14 @@ func (y *ytdlp) downloadSubtitles(ctx context.Context, in DownloadSubtitlesInput
 	}
 	if !langRe.MatchString(lang) {
 		return DownloadSubtitlesResult{}, errLang
+	}
+
+	format := strings.TrimSpace(strings.ToLower(in.Format))
+	if format == "" {
+		format = subtitleFormatText
+	}
+	if format != subtitleFormatText && format != subtitleFormatVTT {
+		return DownloadSubtitlesResult{}, fmt.Errorf("format must be %q or %q", subtitleFormatText, subtitleFormatVTT)
 	}
 
 	dir, err := os.MkdirTemp("", "yt-dlp-mcp-*")
@@ -305,17 +318,37 @@ func (y *ytdlp) downloadSubtitles(ctx context.Context, in DownloadSubtitlesInput
 		}
 	}()
 
+	subFormat := "json3/vtt"
+	if format == subtitleFormatVTT {
+		subFormat = "vtt"
+	}
+
 	args := []string{
 		"--skip-download",
 		"--no-playlist",
 		"--write-auto-subs",
 		"--sub-langs", lang,
-		"--sub-format", "json3/vtt",
+		"--sub-format", subFormat,
 		"--output", "%(id)s.%(ext)s",
 		rawURL,
 	}
 	if _, err := y.run(ctx, args, dir, in.TimeoutMS); err != nil {
 		return DownloadSubtitlesResult{}, err
+	}
+
+	if format == subtitleFormatVTT {
+		path, err := findFileByExt(dir, ".vtt")
+		if err != nil {
+			return DownloadSubtitlesResult{}, err
+		}
+		text, err := readSubtitleFile(path)
+		if err != nil {
+			return DownloadSubtitlesResult{}, err
+		}
+		if strings.TrimSpace(text) == "" {
+			return DownloadSubtitlesResult{}, errors.New("subtitle file contained no text")
+		}
+		return DownloadSubtitlesResult{Text: text, Lang: lang, Format: format}, nil
 	}
 
 	path, err := findFileByExt(dir, ".json3")
@@ -340,7 +373,7 @@ func (y *ytdlp) downloadSubtitles(ctx context.Context, in DownloadSubtitlesInput
 		return DownloadSubtitlesResult{}, errors.New("subtitle file contained no text")
 	}
 
-	return DownloadSubtitlesResult{Text: text, Lang: lang}, nil
+	return DownloadSubtitlesResult{Text: text, Lang: lang, Format: format}, nil
 }
 
 // run executes yt-dlp with the given arguments inside an optional working
@@ -507,6 +540,16 @@ func findFileByExt(dir, ext string) (string, error) {
 		return "", fmt.Errorf("no %s subtitles found for requested language", ext)
 	}
 	return matches[0], nil
+}
+
+// readSubtitleFile returns a subtitle file verbatim.
+func readSubtitleFile(path string) (string, error) {
+	//nolint:gosec // path is selected from a per-request temp directory created by this process.
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return "", err
+	}
+	return string(data), nil
 }
 
 // extractJSON3Text reads a YouTube json3 subtitle file and returns the
