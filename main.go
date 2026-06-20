@@ -15,6 +15,7 @@ import (
 	"os/signal"
 	"path/filepath"
 	"regexp"
+	"strconv"
 	"strings"
 	"sync"
 	"syscall"
@@ -65,7 +66,7 @@ type VideoResult struct {
 type DownloadSubtitlesInput struct {
 	URL       string `json:"url" jsonschema:"required"`
 	Lang      string `json:"lang,omitempty"`
-	Format    string `json:"format,omitempty" jsonschema:"Output format: text (default) returns merged plain text; vtt returns WebVTT cues with timestamps."`
+	Format    string `json:"format,omitempty" jsonschema:"Output format: text (default) returns merged plain text; timestamped_text returns compact timestamped lines for summarization and table-of-contents generation."`
 	TimeoutMS int64  `json:"timeout_ms,omitempty"`
 }
 
@@ -106,7 +107,8 @@ type json3File struct {
 }
 
 type json3Event struct {
-	Segs []json3Segment `json:"segs"`
+	TStartMS int64          `json:"tStartMs"`
+	Segs     []json3Segment `json:"segs"`
 }
 
 type json3Segment struct {
@@ -125,8 +127,8 @@ const (
 	maxSearchLimit     = 20
 	maxQueryLength     = 300
 
-	subtitleFormatText = "text"
-	subtitleFormatVTT  = "vtt"
+	subtitleFormatText            = "text"
+	subtitleFormatTimestampedText = "timestamped_text"
 )
 
 func main() {
@@ -228,7 +230,7 @@ func registerTools(s *mcpserver.MCPServer, y *ytdlp) {
 	})
 
 	s.AddTool(mcp.NewTool("download_subtitles",
-		mcp.WithDescription("Download YouTube auto subtitles with yt-dlp and return merged plain text or timestamped WebVTT."),
+		mcp.WithDescription("Download YouTube auto subtitles with yt-dlp and return merged text or compact timestamped text."),
 		mcp.WithInputSchema[DownloadSubtitlesInput](),
 		mcp.WithOutputSchema[DownloadSubtitlesResult](),
 	), func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
@@ -237,7 +239,7 @@ func registerTools(s *mcpserver.MCPServer, y *ytdlp) {
 			return mcp.NewToolResultError(err.Error()), nil
 		}
 		res, err := y.downloadSubtitles(ctx, in)
-		return resultOrToolError(res, err)
+		return subtitleResultOrToolError(res, err)
 	})
 }
 
@@ -248,6 +250,16 @@ func resultOrToolError[T any](res T, err error) (*mcp.CallToolResult, error) {
 		return mcp.NewToolResultError(err.Error()), nil
 	}
 	return mcp.NewToolResultStructuredOnly(res), nil
+}
+
+// subtitleResultOrToolError returns full subtitle data only in structuredContent.
+// The compact content fallback avoids doubling large subtitle responses.
+func subtitleResultOrToolError(res DownloadSubtitlesResult, err error) (*mcp.CallToolResult, error) {
+	if err != nil {
+		return mcp.NewToolResultError(err.Error()), nil
+	}
+	fallback := fmt.Sprintf("Downloaded %s subtitles for %s (%d bytes).", res.Format, res.Lang, len(res.Text))
+	return mcp.NewToolResultStructured(res, fallback), nil
 }
 
 // searchVideos searches YouTube for videos matching the given query using
@@ -301,8 +313,8 @@ func (y *ytdlp) downloadSubtitles(ctx context.Context, in DownloadSubtitlesInput
 	if format == "" {
 		format = subtitleFormatText
 	}
-	if format != subtitleFormatText && format != subtitleFormatVTT {
-		return DownloadSubtitlesResult{}, fmt.Errorf("format must be %q or %q", subtitleFormatText, subtitleFormatVTT)
+	if format != subtitleFormatText && format != subtitleFormatTimestampedText {
+		return DownloadSubtitlesResult{}, fmt.Errorf("format must be %q or %q", subtitleFormatText, subtitleFormatTimestampedText)
 	}
 
 	dir, err := os.MkdirTemp("", "yt-dlp-mcp-*")
@@ -318,37 +330,17 @@ func (y *ytdlp) downloadSubtitles(ctx context.Context, in DownloadSubtitlesInput
 		}
 	}()
 
-	subFormat := "json3/vtt"
-	if format == subtitleFormatVTT {
-		subFormat = "vtt"
-	}
-
 	args := []string{
 		"--skip-download",
 		"--no-playlist",
 		"--write-auto-subs",
 		"--sub-langs", lang,
-		"--sub-format", subFormat,
+		"--sub-format", "json3/vtt",
 		"--output", "%(id)s.%(ext)s",
 		rawURL,
 	}
 	if _, err := y.run(ctx, args, dir, in.TimeoutMS); err != nil {
 		return DownloadSubtitlesResult{}, err
-	}
-
-	if format == subtitleFormatVTT {
-		path, err := findFileByExt(dir, ".vtt")
-		if err != nil {
-			return DownloadSubtitlesResult{}, err
-		}
-		text, err := readSubtitleFile(path)
-		if err != nil {
-			return DownloadSubtitlesResult{}, err
-		}
-		if strings.TrimSpace(text) == "" {
-			return DownloadSubtitlesResult{}, errors.New("subtitle file contained no text")
-		}
-		return DownloadSubtitlesResult{Text: text, Lang: lang, Format: format}, nil
 	}
 
 	path, err := findFileByExt(dir, ".json3")
@@ -361,7 +353,11 @@ func (y *ytdlp) downloadSubtitles(ctx context.Context, in DownloadSubtitlesInput
 	}
 
 	var text string
-	if strings.HasSuffix(path, ".json3") {
+	if format == subtitleFormatTimestampedText && strings.HasSuffix(path, ".json3") {
+		text, err = extractJSON3TimestampedText(path)
+	} else if format == subtitleFormatTimestampedText {
+		text, err = extractVTTTimestampedText(path)
+	} else if strings.HasSuffix(path, ".json3") {
 		text, err = extractJSON3Text(path)
 	} else {
 		text, err = extractVTTText(path)
@@ -542,16 +538,6 @@ func findFileByExt(dir, ext string) (string, error) {
 	return matches[0], nil
 }
 
-// readSubtitleFile returns a subtitle file verbatim.
-func readSubtitleFile(path string) (string, error) {
-	//nolint:gosec // path is selected from a per-request temp directory created by this process.
-	data, err := os.ReadFile(path)
-	if err != nil {
-		return "", err
-	}
-	return string(data), nil
-}
-
 // extractJSON3Text reads a YouTube json3 subtitle file and returns the
 // concatenated, whitespace-normalised text.
 func extractJSON3Text(path string) (string, error) {
@@ -568,11 +554,47 @@ func extractJSON3Text(path string) (string, error) {
 
 	parts := make([]string, 0)
 	for _, event := range sub.Events {
-		for _, seg := range event.Segs {
-			parts = append(parts, seg.UTF8)
+		text := json3EventText(event)
+		if text != "" {
+			parts = append(parts, text)
 		}
 	}
 	return strings.Join(strings.Fields(strings.Join(parts, " ")), " "), nil
+}
+
+// extractJSON3TimestampedText reads a YouTube json3 subtitle file and returns
+// compact timestamped subtitle lines.
+func extractJSON3TimestampedText(path string) (string, error) {
+	//nolint:gosec // path is selected from a per-request temp directory created by this process.
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return "", err
+	}
+
+	var sub json3File
+	if err := json.Unmarshal(data, &sub); err != nil {
+		return "", err
+	}
+
+	lines := make([]string, 0)
+	var previous string
+	for _, event := range sub.Events {
+		text := json3EventText(event)
+		if text == "" || text == previous {
+			continue
+		}
+		lines = append(lines, fmt.Sprintf("[%s] %s", formatTimestamp(event.TStartMS), text))
+		previous = text
+	}
+	return strings.Join(lines, "\n"), nil
+}
+
+func json3EventText(event json3Event) string {
+	parts := make([]string, 0, len(event.Segs))
+	for _, seg := range event.Segs {
+		parts = append(parts, seg.UTF8)
+	}
+	return strings.Join(strings.Fields(strings.Join(parts, " ")), " ")
 }
 
 // extractVTTText reads a WebVTT subtitle file and returns the concatenated,
@@ -607,6 +629,134 @@ func extractVTTText(path string) (string, error) {
 		return "", err
 	}
 	return strings.Join(strings.Fields(strings.Join(parts, " ")), " "), nil
+}
+
+// extractVTTTimestampedText reads a WebVTT subtitle file and returns compact
+// timestamped subtitle lines.
+func extractVTTTimestampedText(path string) (string, error) {
+	//nolint:gosec // path is selected from a per-request temp directory created by this process.
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return "", err
+	}
+
+	scanner := bufio.NewScanner(bytes.NewReader(data))
+	var lines []string
+	var cueStart string
+	var cueParts []string
+	var previous string
+
+	flushCue := func() {
+		if cueStart == "" {
+			cueParts = nil
+			return
+		}
+		text := normalizeVTTText(cueParts)
+		if text != "" && text != previous {
+			lines = append(lines, fmt.Sprintf("[%s] %s", cueStart, text))
+			previous = text
+		}
+		cueStart = ""
+		cueParts = nil
+	}
+
+	for scanner.Scan() {
+		trimmed := strings.TrimSpace(scanner.Text())
+		switch {
+		case trimmed == "":
+			flushCue()
+		case strings.HasPrefix(trimmed, "WEBVTT") ||
+			strings.HasPrefix(trimmed, "Kind:") ||
+			strings.HasPrefix(trimmed, "Language:"):
+			continue
+		case strings.Contains(trimmed, "-->"):
+			flushCue()
+			start, _, _ := strings.Cut(trimmed, "-->")
+			cueStart = formatVTTTimestamp(strings.TrimSpace(start))
+		default:
+			cueParts = append(cueParts, trimmed)
+		}
+	}
+	flushCue()
+	if err := scanner.Err(); err != nil {
+		return "", err
+	}
+	return strings.Join(lines, "\n"), nil
+}
+
+func normalizeVTTText(parts []string) string {
+	if len(parts) == 0 {
+		return ""
+	}
+	cleaned := make([]string, 0, len(parts))
+	for _, part := range parts {
+		part = strings.TrimSpace(vttTagRe.ReplaceAllString(part, ""))
+		if part != "" {
+			cleaned = append(cleaned, part)
+		}
+	}
+	return strings.Join(strings.Fields(strings.Join(cleaned, " ")), " ")
+}
+
+func formatTimestamp(ms int64) string {
+	if ms < 0 {
+		ms = 0
+	}
+	totalSeconds := ms / 1000
+	hours := totalSeconds / 3600
+	minutes := (totalSeconds % 3600) / 60
+	seconds := totalSeconds % 60
+	return fmt.Sprintf("%02d:%02d:%02d", hours, minutes, seconds)
+}
+
+func formatVTTTimestamp(ts string) string {
+	ms, ok := parseVTTTimestamp(ts)
+	if !ok {
+		return ts
+	}
+	return formatTimestamp(ms)
+}
+
+func parseVTTTimestamp(ts string) (int64, bool) {
+	parts := strings.Split(ts, ":")
+	if len(parts) != 2 && len(parts) != 3 {
+		return 0, false
+	}
+
+	multiplier := int64(60)
+	totalSeconds := int64(0)
+	for i := len(parts) - 2; i >= 0; i-- {
+		value, err := strconv.ParseInt(parts[i], 10, 64)
+		if err != nil || value < 0 {
+			return 0, false
+		}
+		totalSeconds += value * multiplier
+		multiplier *= 60
+	}
+
+	secondsPart := strings.ReplaceAll(parts[len(parts)-1], ",", ".")
+	secondsPieces := strings.SplitN(secondsPart, ".", 2)
+	seconds, err := strconv.ParseInt(secondsPieces[0], 10, 64)
+	if err != nil || seconds < 0 {
+		return 0, false
+	}
+
+	milliseconds := int64(0)
+	if len(secondsPieces) == 2 {
+		fraction := secondsPieces[1]
+		if len(fraction) > 3 {
+			fraction = fraction[:3]
+		}
+		for len(fraction) < 3 {
+			fraction += "0"
+		}
+		milliseconds, err = strconv.ParseInt(fraction, 10, 64)
+		if err != nil {
+			return 0, false
+		}
+	}
+
+	return (totalSeconds+seconds)*1000 + milliseconds, true
 }
 
 // commandEnv builds a minimal environment variable slice containing only
