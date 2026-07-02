@@ -7,7 +7,7 @@ github.com/google/jsonschema-go/jsonschema
 # github.com/google/uuid v1.6.0
 ## explicit
 github.com/google/uuid
-# github.com/mark3labs/mcp-go v0.55.0
+# github.com/mark3labs/mcp-go v0.55.1
 ## explicit; go 1.25.5
 github.com/mark3labs/mcp-go/mcp
 github.com/mark3labs/mcp-go/server
