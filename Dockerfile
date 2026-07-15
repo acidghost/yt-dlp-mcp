@@ -12,7 +12,7 @@ RUN just version="${BUILD_VERSION}" commit_sha="${BUILD_COMMIT}" build \
     && mv build/yt-dlp-mcp-linux-* /usr/local/bin/yt-dlp-mcp
 
 FROM python:3.14-slim@sha256:44dd04494ee8f3b538294360e7c4b3acb87c8268e4d0a4828a6500b1eff50061
-COPY --from=denoland/deno:2.9.1@sha256:c40ad61ed0b40cca8fda05a2bbf44f8e02485bebec8ee4820bdb4b6fff42599d /usr/bin/deno /usr/bin/deno
+COPY --from=denoland/deno:2.9.2@sha256:69a9f3033e3f381770452648b1cbf4ae96ea409f7ef24f30afeff3d380705f62 /usr/bin/deno /usr/bin/deno
 COPY requirements.txt /tmp/requirements.txt
 RUN python3 -m pip install --no-cache-dir --require-hashes -r /tmp/requirements.txt \
  && python3 -m pip check \
