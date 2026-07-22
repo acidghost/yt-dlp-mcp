@@ -5,7 +5,7 @@ go 1.25.5
 toolchain go1.26.5
 
 require (
-	github.com/alecthomas/kong v1.15.0
+	github.com/alecthomas/kong v1.16.0
 	github.com/mark3labs/mcp-go v0.56.0
 	github.com/rs/zerolog v1.35.1
 )
