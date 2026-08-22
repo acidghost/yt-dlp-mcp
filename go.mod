@@ -2,7 +2,7 @@ module github.com/acidghost/yt-dlp-mcp
 
 go 1.25.5
 
-toolchain go1.26.5
+toolchain go1.26.6
 
 require (
 	github.com/alecthomas/kong v1.16.0
