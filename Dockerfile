@@ -11,7 +11,7 @@ ARG BUILD_COMMIT=unknown
 RUN just version="${BUILD_VERSION}" commit_sha="${BUILD_COMMIT}" build \
     && mv build/yt-dlp-mcp-linux-* /usr/local/bin/yt-dlp-mcp
 
-FROM python:3.14-slim@sha256:44dd04494ee8f3b538294360e7c4b3acb87c8268e4d0a4828a6500b1eff50061
+FROM python:3.14-slim@sha256:cad9a2c871761c413caa6fdd6441c783451e740a48aaeba60ae62a8b53525ef6
 COPY --from=denoland/deno:2.9.6@sha256:2014dc167ece617ef7e7ba40631ac2234c59e75ce693e7cc2dc2602b3c87859d /usr/bin/deno /usr/bin/deno
 COPY requirements.txt /tmp/requirements.txt
 RUN python3 -m pip install --no-cache-dir --require-hashes -r /tmp/requirements.txt \
