@@ -8,8 +8,7 @@ import (
 	"os"
 	"reflect"
 	"strconv"
-
-	"github.com/google/jsonschema-go/jsonschema"
+	"strings"
 )
 
 var errToolSchemaConflict = errors.New("provide either InputSchema or RawInputSchema, not both")
@@ -566,10 +565,10 @@ func (r CallToolResult) MarshalJSON() ([]byte, error) {
 // UnmarshalJSON implements custom JSON unmarshaling for CallToolResult
 func (r *CallToolResult) UnmarshalJSON(data []byte) error {
 	type result struct {
-		Meta                *Meta             `json:"_meta,omitempty"`
-		Content             []json.RawMessage `json:"content"`
-		StructuredContent   json.RawMessage   `json:"structuredContent,omitempty"`
-		IsError             bool              `json:"isError,omitempty"`
+		Meta              *Meta             `json:"_meta,omitempty"`
+		Content           []json.RawMessage `json:"content"`
+		StructuredContent json.RawMessage   `json:"structuredContent,omitempty"`
+		IsError           bool              `json:"isError,omitempty"`
 	}
 
 	var raw result
@@ -809,12 +808,38 @@ func toolArgumentsSchemaUnmarshalJSON(data []byte, tis *ToolArgumentsSchema) err
 		return err
 	}
 
-	// If $defs wasn't provided but definitions was, use definitions
+	// If $defs wasn't provided but definitions was, use definitions.
+	// Marshaling re-emits Defs as "$defs", so local "#/definitions/..." $ref
+	// pointers must be rewritten to "#/$defs/..." or the round-tripped schema
+	// carries dangling references that strict validators reject.
 	if tis.Defs == nil && aux.Definitions != nil {
 		tis.Defs = aux.Definitions
+		rewriteDraft07LocalRefs(tis.Defs)
+		rewriteDraft07LocalRefs(tis.Properties)
+		rewriteDraft07LocalRefs(tis.AdditionalProperties)
 	}
 
 	return nil
+}
+
+// rewriteDraft07LocalRefs rewrites local draft-07 "#/definitions/..." $ref
+// pointers to their 2019-09+ "#/$defs/..." equivalent in place. It walks
+// nested maps and slices; non-local refs are left untouched.
+func rewriteDraft07LocalRefs(node any) {
+	const draft07Prefix = "#/definitions/"
+	switch v := node.(type) {
+	case map[string]any:
+		if ref, ok := v["$ref"].(string); ok && strings.HasPrefix(ref, draft07Prefix) {
+			v["$ref"] = "#/$defs/" + ref[len(draft07Prefix):]
+		}
+		for _, child := range v {
+			rewriteDraft07LocalRefs(child)
+		}
+	case []any:
+		for _, child := range v {
+			rewriteDraft07LocalRefs(child)
+		}
+	}
 }
 
 type ToolAnnotation struct {
@@ -914,7 +939,7 @@ func WithDeferLoading(deferLoading bool) ToolOption {
 // It accepts any Go type, usually a struct, and automatically generates a JSON schema from it.
 func WithInputSchema[T any]() ToolOption {
 	return func(t *Tool) {
-		schema, err := jsonschema.For[T](&jsonschema.ForOptions{IgnoreInvalidTypes: true})
+		schema, err := schemaFor[T]()
 		if err != nil {
 			fmt.Fprintln(os.Stderr, err)
 			return
@@ -965,7 +990,7 @@ func WithRawInputSchema(schema json.RawMessage) ToolOption {
 // It accepts any Go type, usually a struct, and automatically generates a JSON schema from it.
 func WithOutputSchema[T any]() ToolOption {
 	return func(t *Tool) {
-		schema, err := jsonschema.For[T](&jsonschema.ForOptions{IgnoreInvalidTypes: true})
+		schema, err := schemaFor[T]()
 		if err != nil {
 			fmt.Fprintln(os.Stderr, err)
 			return

@@ -101,6 +101,26 @@ func WithHeartbeatInterval(interval time.Duration) StreamableHTTPOption {
 	}
 }
 
+// WithEventStore enables stream resumability, per the "Resumability and
+// Redelivery" section of the MCP Streamable HTTP transport specification.
+//
+// Every JSON-RPC message delivered on an SSE stream is recorded in store
+// before it is sent and carries the store-issued event ID in the SSE id
+// field. A client whose connection broke can then reconnect with a GET
+// carrying the standard Last-Event-ID header to be redelivered everything it
+// missed on that stream and keep receiving from it.
+//
+// With an event store configured, session transport state survives client
+// disconnects so that messages produced while no client is connected can
+// still be recorded. It is reclaimed, and the session's events are purged
+// from the store, when the session is terminated (DELETE) or, with
+// WithSessionIdleTTL configured, when the session idles out.
+func WithEventStore(store EventStore) StreamableHTTPOption {
+	return func(s *StreamableHTTPServer) {
+		s.eventStore = store
+	}
+}
+
 // WithDisableStreaming prevents the server from responding to GET requests with
 // a streaming response. Instead, it will respond with a 405 Method Not Allowed status.
 // This can be useful in scenarios where streaming is not desired or supported.
@@ -259,15 +279,20 @@ func WithStreamableHTTPCORS(opts ...CORSOption) StreamableHTTPOption {
 // not trigger the session registration. So the methods like `SendNotificationToSpecificClient`
 // or `hooks.onRegisterSession` will not be triggered for POST messages.
 //
-// The current implementation does not support the following features from the specification:
-//   - Stream Resumability
+// Stream resumability (redelivery of the messages a client missed while its
+// SSE connection was broken) is opt-in via WithEventStore.
 type StreamableHTTPServer struct {
 	server                   *MCPServer
 	sessionTools             *sessionToolsStore
 	sessionResources         *sessionResourcesStore
 	sessionResourceTemplates *sessionResourceTemplatesStore
-	sessionRequestIDs        sync.Map // sessionId --> last requestID(*atomic.Int64)
-	activeSessions           sync.Map // sessionId --> *streamableHttpSession (for sampling responses)
+	activeSessions           sync.Map     // sessionId --> *streamableHttpSession (for sampling responses)
+	requestIDCounter         atomic.Int64 // server -> client request IDs, shared across sessions
+
+	eventStore         EventStore
+	resumableStreams   sync.Map // streamID --> *resumableStream
+	listeningStreams   sync.Map // sessionID --> *resumableStream (the standalone listening stream)
+	listeningPumpStops sync.Map // sessionID --> chan struct{} (stops the session's pump)
 
 	httpServer *http.Server
 	mu         sync.RWMutex
@@ -404,6 +429,8 @@ func (s *StreamableHTTPServer) ServeHTTP(w http.ResponseWriter, r *http.Request)
 		s.handleGet(hw, hr)
 	case http.MethodDelete:
 		s.handleDelete(hw, hr)
+	case http.MethodHead:
+		w.WriteHeader(http.StatusOK)
 	default:
 		http.NotFound(w, r)
 	}
@@ -458,14 +485,65 @@ func (s *StreamableHTTPServer) Shutdown(ctx context.Context) error {
 		s.sweeperCancel()
 	}
 
+	s.CloseSessions(ctx)
+
 	// shutdown the server if needed (may use as a http.Handler)
 	s.mu.RLock()
 	srv := s.httpServer
 	s.mu.RUnlock()
-	if srv != nil {
-		return srv.Shutdown(ctx)
+	if srv == nil {
+		return nil
 	}
-	return nil
+
+	shutdownDone := make(chan error, 1)
+	go func() {
+		shutdownDone <- srv.Shutdown(ctx)
+	}()
+
+	drainTicker := time.NewTicker(5 * time.Millisecond)
+	defer drainTicker.Stop()
+
+	for {
+		select {
+		case err := <-shutdownDone:
+			return err
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-drainTicker.C:
+			// Drain sessions registered after the initial CloseSessions snapshot.
+			s.CloseSessions(ctx)
+		}
+	}
+}
+
+// CloseSessions terminates all active streamable HTTP listening sessions
+// without stopping the HTTP server. This unblocks long-lived GET handlers so
+// Shutdown can complete while clients are still connected.
+func (s *StreamableHTTPServer) CloseSessions(ctx context.Context) {
+	sessionIDs := make([]string, 0)
+	s.activeSessions.Range(func(key, value any) bool {
+		sessionID, ok := key.(string)
+		if !ok {
+			return true
+		}
+		if session, ok := value.(*streamableHttpSession); ok {
+			session.closeDone()
+		}
+		sessionIDs = append(sessionIDs, sessionID)
+		return true
+	})
+
+	mgr := s.sessionIdManager
+	if mgr == nil {
+		mgr = s.sessionIdManagerResolver.ResolveSessionIdManager(nil)
+	}
+
+	for _, sessionID := range sessionIDs {
+		if _, err := mgr.Terminate(sessionID); err != nil {
+			s.logger.Warn("failed to terminate session during CloseSessions", "sessionID", sessionID, "err", err)
+		}
+		s.cleanupSessionState(ctx, sessionID)
+	}
 }
 
 // --- internal methods ---
@@ -576,7 +654,7 @@ func (s *StreamableHTTPServer) handlePost(w HTTPResponseWriter, r *HTTPRequest) 
 
 	// Create ephemeral session if no persistent session exists
 	if session == nil {
-		session = newStreamableHttpSession(sessionID, s.sessionTools, s.sessionResources, s.sessionResourceTemplates, s.sessionLogLevels)
+		session = newStreamableHttpSession(sessionID, s.sessionTools, s.sessionResources, s.sessionResourceTemplates, s.sessionLogLevels, &s.requestIDCounter)
 	}
 
 	// Set the client context before handling the message
@@ -598,7 +676,69 @@ func (s *StreamableHTTPServer) handlePost(w HTTPResponseWriter, r *HTTPRequest) 
 	// application/json response (the upgrade simply won't fire).
 	canStream := w.CanStream()
 
+	// Request stream for resumability, created lazily when the first SSE
+	// message for this request is delivered. Guarded by mu. Stored events
+	// must outlive the request context, which ends with the connection.
+	var rst *resumableStream
+	storeCtx := context.WithoutCancel(ctx)
+
+	// deliverResumable records msg on the request's resumable stream (creating
+	// it on first use), upgrading the response to SSE first while the
+	// connection is still usable. Callers must hold mu.
+	deliverResumable := func(msg any, last bool) {
+		if rst == nil {
+			rst = s.newResumableStream(sessionID, w)
+		}
+		if ctx.Err() != nil {
+			rst.clearPostWriter()
+		} else if !upgradedHeader {
+			w.Header().Set("Content-Type", "text/event-stream")
+			w.Header().Set("Connection", "keep-alive")
+			w.Header().Set("Cache-Control", "no-cache")
+			w.WriteHeader(http.StatusOK)
+			upgradedHeader = true
+		}
+		rst.deliver(storeCtx, msg, last)
+	}
+
+	// forwarderExited lets the response path wait until the forwarder can no
+	// longer be holding an undelivered notification.
+	forwarderExited := make(chan struct{})
+
+	// When the response can stream, server requests issued while this message
+	// is being handled (for example elicitation/create from a tool handler)
+	// are written to this POST's SSE stream, per the Streamable HTTP guidance
+	// that server requests on a POST stream should relate to the originating
+	// request. The standalone GET stream remains the path for everything else.
+	var scopedRequests chan mcp.JSONRPCRequest
+	if canStream {
+		scopedRequests = make(chan mcp.JSONRPCRequest, 8)
+		// Registration makes responses to request-scoped server requests
+		// routable when nothing else has registered the session (stateless
+		// mode without a standalone GET stream). It only happens once a
+		// request is actually sent on this stream, and only the POST that
+		// stored the registration removes it, so registrations made by the
+		// GET handler or by stateful initialization are never touched.
+		var ownsRegistration atomic.Bool
+		register := sync.OnceFunc(func() {
+			if _, loaded := s.activeSessions.LoadOrStore(sessionID, session); !loaded {
+				ownsRegistration.Store(true)
+			}
+		})
+		defer func() {
+			if ownsRegistration.Load() {
+				s.activeSessions.CompareAndDelete(sessionID, session)
+			}
+		}()
+		ctx = context.WithValue(ctx, requestScopedSSEKey{}, &requestScopedSSE{
+			requests: scopedRequests,
+			done:     done,
+			register: register,
+		})
+	}
+
 	go func() {
+		defer close(forwarderExited)
 		defer func() {
 			if r := recover(); r != nil {
 				s.logger.Error("panic in notification forwarder", "panic", r)
@@ -613,6 +753,11 @@ func (s *StreamableHTTPServer) handlePost(w HTTPResponseWriter, r *HTTPRequest) 
 					// if the done chan is closed, as the request is terminated, just return
 					select {
 					case <-done:
+						// The notification is already off the channel; with an
+						// event store it must still be recorded.
+						if s.eventStore != nil && canStream {
+							deliverResumable(nt, false)
+						}
 						return
 					default:
 					}
@@ -623,6 +768,11 @@ func (s *StreamableHTTPServer) handlePost(w HTTPResponseWriter, r *HTTPRequest) 
 						return
 					}
 					defer w.Flush()
+
+					if s.eventStore != nil {
+						deliverResumable(nt, false)
+						return
+					}
 
 					// if there's notifications, upgradedHeader to SSE response
 					if !upgradedHeader {
@@ -636,6 +786,39 @@ func (s *StreamableHTTPServer) handlePost(w HTTPResponseWriter, r *HTTPRequest) 
 					if err != nil {
 						s.logger.Error("Failed to write SSE event", "err", err)
 						return
+					}
+				}()
+			case req := <-scopedRequests:
+				func() {
+					mu.Lock()
+					defer mu.Unlock()
+					select {
+					case <-done:
+						// The request is already off the channel; with an
+						// event store it must still be recorded so a resuming
+						// client sees it.
+						if s.eventStore != nil {
+							deliverResumable(req, false)
+						}
+						return
+					default:
+					}
+					defer w.Flush()
+
+					if s.eventStore != nil {
+						deliverResumable(req, false)
+						return
+					}
+
+					if !upgradedHeader {
+						w.Header().Set("Content-Type", "text/event-stream")
+						w.Header().Set("Connection", "keep-alive")
+						w.Header().Set("Cache-Control", "no-cache")
+						w.WriteHeader(http.StatusOK)
+						upgradedHeader = true
+					}
+					if err := writeSSEEvent(w, req); err != nil {
+						s.logger.Error("Failed to write SSE event", "err", err)
 					}
 				}()
 			case <-done:
@@ -661,6 +844,14 @@ func (s *StreamableHTTPServer) handlePost(w HTTPResponseWriter, r *HTTPRequest) 
 	}
 
 	// Write response
+	//
+	// With an event store, stop the forwarder before draining so that exactly
+	// one consumer records whatever notifications remain, preserving their
+	// order ahead of the response.
+	if s.eventStore != nil {
+		close(done)
+		<-forwarderExited
+	}
 	mu.Lock()
 
 drainLoop:
@@ -668,6 +859,11 @@ drainLoop:
 		select {
 		case nt := <-session.notificationChannel:
 			if !canStream {
+				continue
+			}
+			if s.eventStore != nil {
+				deliverResumable(nt, false)
+				w.Flush()
 				continue
 			}
 			if !upgradedHeader {
@@ -687,16 +883,30 @@ drainLoop:
 	}
 
 	// close the done chan before unlocking to signal the goroutine to stop
-	close(done)
+	if s.eventStore == nil {
+		close(done)
+	}
 	mu.Unlock()
 	if ctx.Err() != nil {
+		// The connection is gone, but with an event store the response of an
+		// interrupted SSE request is still recorded so that a resuming client
+		// can be redelivered it.
+		if s.eventStore != nil && (rst != nil || (session.upgradeToSSE.Load() && canStream)) {
+			mu.Lock()
+			deliverResumable(response, true)
+			mu.Unlock()
+		}
 		return
 	}
 	// If client-server communication already upgraded to SSE stream
 	// Also check upgradedHeader: a notification during HandleMessage processing
 	// may have already written SSE headers on this response, so we must continue
 	// in SSE mode to avoid writing JSON on top of SSE data.
-	if (session.upgradeToSSE.Load() && canStream) || upgradedHeader {
+	if s.eventStore != nil && (rst != nil || (session.upgradeToSSE.Load() && canStream)) {
+		mu.Lock()
+		deliverResumable(response, true)
+		mu.Unlock()
+	} else if (session.upgradeToSSE.Load() && canStream) || upgradedHeader {
 		if !upgradedHeader {
 			w.Header().Set("Content-Type", "text/event-stream")
 			w.Header().Set("Connection", "keep-alive")
@@ -707,6 +917,7 @@ drainLoop:
 		if err := writeSSEEvent(w, response); err != nil {
 			s.logger.Error("Failed to write final SSE response event", "err", err)
 		}
+		w.Flush()
 	} else {
 		w.Header().Set("Content-Type", "application/json")
 		if isInitializeRequest && sessionID != "" {
@@ -753,6 +964,15 @@ func (s *StreamableHTTPServer) handleGet(w HTTPResponseWriter, r *HTTPRequest) {
 		return
 	}
 
+	// A GET carrying Last-Event-ID resumes a previously broken SSE stream
+	// rather than opening a fresh listening stream.
+	if s.eventStore != nil {
+		if lastEventID := r.header().Get("Last-Event-ID"); lastEventID != "" {
+			s.handleResumeGet(w, r, lastEventID)
+			return
+		}
+	}
+
 	sessionID := r.header().Get(HeaderKeySessionID)
 	// The MCP specification doesn't require validating session ID for GET requests.
 	// If no session ID is provided by the client, generate one using the configured SessionIdManager
@@ -765,7 +985,7 @@ func (s *StreamableHTTPServer) handleGet(w HTTPResponseWriter, r *HTTPRequest) {
 	// Get or create session atomically to prevent TOCTOU races
 	// where concurrent GETs could both create and register duplicate sessions
 	var session *streamableHttpSession
-	newSession := newStreamableHttpSession(sessionID, s.sessionTools, s.sessionResources, s.sessionResourceTemplates, s.sessionLogLevels)
+	newSession := newStreamableHttpSession(sessionID, s.sessionTools, s.sessionResources, s.sessionResourceTemplates, s.sessionLogLevels, &s.requestIDCounter)
 	actual, loaded := s.activeSessions.LoadOrStore(sessionID, newSession)
 	session = actual.(*streamableHttpSession)
 
@@ -776,12 +996,21 @@ func (s *StreamableHTTPServer) handleGet(w HTTPResponseWriter, r *HTTPRequest) {
 			writeHTTPErrorf(w, http.StatusBadRequest, "Session registration failed: %v", err)
 			return
 		}
-		defer s.server.UnregisterSession(r.ctx(), sessionID)
-		defer s.activeSessions.Delete(sessionID)
-		defer s.sessionRequestIDs.Delete(sessionID)
+		if s.eventStore == nil {
+			defer s.server.UnregisterSession(r.ctx(), sessionID)
+			defer s.activeSessions.Delete(sessionID)
+		}
+		// With an event store, the session outlives the connection so that
+		// messages produced while the client is away are recorded for
+		// replay; it is cleaned up on DELETE or by the idle sweeper.
 	}
 
 	s.touchSession(sessionID)
+
+	if s.eventStore != nil {
+		s.serveListeningStream(w, r, sessionID, session)
+		return
+	}
 
 	// Set the client context before handling the message
 	w.Header().Set("Content-Type", "text/event-stream")
@@ -912,6 +1141,8 @@ func (s *StreamableHTTPServer) handleGet(w HTTPResponseWriter, r *HTTPRequest) {
 			s.touchSession(sessionID)
 		case <-ctx.Done():
 			return
+		case <-session.done:
+			return
 		}
 	}
 }
@@ -995,7 +1226,10 @@ func (s *StreamableHTTPServer) handleSamplingResponse(w HTTPResponseWriter, r *H
 		if err := json.Unmarshal(responseMessage.Error, &jsonrpcError); err != nil {
 			response.err = fmt.Errorf("failed to parse error: %v", err)
 		} else {
-			response.err = fmt.Errorf("sampling error %d: %s", jsonrpcError.Code, jsonrpcError.Message)
+			// Defer building the final error to deliverSamplingResponse, which
+			// knows which method (sampling/createMessage, elicitation/create, or
+			// roots/list) this response corresponds to.
+			response.clientError = &clientJSONRPCError{code: jsonrpcError.Code, message: jsonrpcError.Message}
 		}
 	} else if responseMessage.Result != nil {
 		// Store the result to be unmarshaled later
@@ -1032,17 +1266,30 @@ func (s *StreamableHTTPServer) deliverSamplingResponse(w HTTPResponseWriter, ses
 		return fmt.Errorf("invalid session type for session %s", sessionID)
 	}
 
-	// Look up the dedicated response channel for this specific request
-	responseChannelInterface, exists := session.samplingRequests.Load(response.requestID)
+	// Look up the dedicated pending request for this specific request ID.
+	pendingInterface, exists := session.samplingRequests.Load(response.requestID)
 	if !exists {
 		writeHTTPError(w, "No pending sampling request found for the given request ID", http.StatusBadRequest)
 		return fmt.Errorf("no pending request found for session %s, request %d", sessionID, response.requestID)
 	}
 
-	responseChan, ok := responseChannelInterface.(chan samplingResponseItem)
+	pending, ok := pendingInterface.(pendingClientRequest)
 	if !ok {
 		writeHTTPError(w, "Failed to deliver response", http.StatusInternalServerError)
-		return fmt.Errorf("invalid response channel type for session %s, request %d", sessionID, response.requestID)
+		return fmt.Errorf("invalid pending request type for session %s, request %d", sessionID, response.requestID)
+	}
+	responseChan := pending.response
+
+	// If the client returned a JSON-RPC error, label it with the method that
+	// actually failed. This shared path serves sampling/createMessage,
+	// elicitation/create and roots/list, so a generic "sampling error" prefix
+	// would misattribute elicitation and roots failures (see #817).
+	if response.clientError != nil {
+		method := pending.method
+		if method == "" {
+			method = mcp.MethodSamplingCreateMessage
+		}
+		response.err = fmt.Errorf("%s error %d: %s", method, response.clientError.code, response.clientError.message)
 	}
 
 	// Attempt to deliver the response with timeout to prevent indefinite blocking
@@ -1068,11 +1315,11 @@ func (s *StreamableHTTPServer) writeJSONRPCError(
 	})
 }
 
-// nextRequestID gets the next incrementing requestID for the current session
+// nextRequestID gets the next requestID for a server-initiated request. The
+// counter is shared with sampling, elicitation and roots requests so IDs never
+// collide within a session.
 func (s *StreamableHTTPServer) nextRequestID(sessionID string) int64 {
-	actual, _ := s.sessionRequestIDs.LoadOrStore(sessionID, new(atomic.Int64))
-	counter := actual.(*atomic.Int64)
-	return counter.Add(1)
+	return s.requestIDCounter.Add(1)
 }
 
 // touchSession records the current time as the last activity for the given session.
@@ -1088,6 +1335,9 @@ func (s *StreamableHTTPServer) touchSession(sessionID string) {
 
 // cleanupSessionState removes all per-session transport state for the given session ID.
 func (s *StreamableHTTPServer) cleanupSessionState(ctx context.Context, sessionID string) {
+	if s.eventStore != nil {
+		s.cleanupResumableState(ctx, sessionID)
+	}
 	// Unregister first to stop notification routing before deleting data.
 	s.server.UnregisterSession(ctx, sessionID)
 	s.activeSessions.Delete(sessionID)
@@ -1095,7 +1345,6 @@ func (s *StreamableHTTPServer) cleanupSessionState(ctx context.Context, sessionI
 	s.sessionResources.delete(sessionID)
 	s.sessionResourceTemplates.delete(sessionID)
 	s.sessionLogLevels.delete(sessionID)
-	s.sessionRequestIDs.Delete(sessionID)
 	s.sessionLastActive.Delete(sessionID)
 }
 
@@ -1310,6 +1559,26 @@ type samplingResponseItem struct {
 	requestID int64
 	result    json.RawMessage
 	err       error
+	// clientError is set when the client returned a JSON-RPC error object.
+	// deliverSamplingResponse turns it into err, labeled with the pending
+	// request's method (sampling/createMessage, elicitation/create, roots/list).
+	clientError *clientJSONRPCError
+}
+
+// clientJSONRPCError holds a JSON-RPC error returned by the client in response
+// to a server-initiated request (sampling, elicitation, or roots).
+type clientJSONRPCError struct {
+	code    int
+	message string
+}
+
+// pendingClientRequest tracks a server-initiated request that is awaiting a
+// client response. Recording the method alongside the response channel lets
+// deliverSamplingResponse attribute a client-returned JSON-RPC error to the
+// method that actually failed instead of always reporting "sampling".
+type pendingClientRequest struct {
+	method   mcp.MCPMethod
+	response chan samplingResponseItem
 }
 
 // Elicitation support types for HTTP transport
@@ -1327,11 +1596,49 @@ type rootsRequestItem struct {
 }
 
 // streamableHttpSession is a session for streamable-http transport
+// requestScopedSSEKey carries a requestScopedSSE in the context of a POST
+// message handler whose response supports SSE.
+type requestScopedSSEKey struct{}
+
+// requestScopedSSE lets server requests issued while a POST message is being
+// handled be written to that POST's SSE response instead of the standalone
+// GET stream.
+type requestScopedSSE struct {
+	requests chan<- mcp.JSONRPCRequest
+	done     <-chan struct{}
+	register func()
+}
+
+// trySend queues the request for the originating POST stream. It reports
+// false when the POST has already finished or ctx expires, so the caller can
+// fall back to the standalone GET stream. While the POST stream is active it
+// waits for buffer space instead of treating backpressure as absence:
+// spilling to the GET stream mid-request would reintroduce the cross-stream
+// routing this type exists to avoid.
+func (r *requestScopedSSE) trySend(ctx context.Context, request mcp.JSONRPCRequest) bool {
+	select {
+	case <-r.done:
+		return false
+	default:
+	}
+	r.register()
+	select {
+	case r.requests <- request:
+		return true
+	case <-r.done:
+		return false
+	case <-ctx.Done():
+		return false
+	}
+}
+
 // When in POST handlers(request/notification), it's ephemeral, and only exists in the life of the request handler.
 // When in GET handlers(listening), it's a real session, and will be registered in the MCP server.
 type streamableHttpSession struct {
 	clientInfoStore // provides Get/SetClientInfo and Get/SetClientCapabilities via method promotion
 
+	done                chan struct{}
+	doneOnce            sync.Once
 	sessionID           string
 	notificationChannel chan mcp.JSONRPCNotification // server -> client notifications
 	tools               *sessionToolsStore
@@ -1345,12 +1652,13 @@ type streamableHttpSession struct {
 	elicitationRequestChan chan elicitationRequestItem // server -> client elicitation requests
 	rootsRequestChan       chan rootsRequestItem       // server -> client list roots requests
 
-	samplingRequests sync.Map     // requestID -> pending sampling request context
-	requestIDCounter atomic.Int64 // for generating unique request IDs
+	samplingRequests sync.Map      // requestID -> pending sampling request context
+	requestIDCounter *atomic.Int64 // shared per server so IDs stay unique across sessions with the same session ID
 }
 
-func newStreamableHttpSession(sessionID string, toolStore *sessionToolsStore, resourcesStore *sessionResourcesStore, templatesStore *sessionResourceTemplatesStore, levels *sessionLogLevelsStore) *streamableHttpSession {
+func newStreamableHttpSession(sessionID string, toolStore *sessionToolsStore, resourcesStore *sessionResourcesStore, templatesStore *sessionResourceTemplatesStore, levels *sessionLogLevelsStore, requestIDCounter *atomic.Int64) *streamableHttpSession {
 	s := &streamableHttpSession{
+		done:                   make(chan struct{}),
 		sessionID:              sessionID,
 		notificationChannel:    make(chan mcp.JSONRPCNotification, 100),
 		tools:                  toolStore,
@@ -1360,8 +1668,17 @@ func newStreamableHttpSession(sessionID string, toolStore *sessionToolsStore, re
 		samplingRequestChan:    make(chan samplingRequestItem, 10),
 		elicitationRequestChan: make(chan elicitationRequestItem, 10),
 		rootsRequestChan:       make(chan rootsRequestItem, 10),
+		requestIDCounter:       requestIDCounter,
 	}
 	return s
+}
+
+// closeDone safely closes the session's done channel exactly once,
+// allowing long-lived GET handlers to exit during server shutdown.
+func (s *streamableHttpSession) closeDone() {
+	s.doneOnce.Do(func() {
+		close(s.done)
+	})
 }
 
 func (s *streamableHttpSession) SessionID() string {
@@ -1446,7 +1763,10 @@ func (s *streamableHttpSession) RequestSampling(ctx context.Context, request mcp
 	}
 
 	// Store the pending request
-	s.samplingRequests.Store(requestID, responseChan)
+	s.samplingRequests.Store(requestID, pendingClientRequest{
+		method:   mcp.MethodSamplingCreateMessage,
+		response: responseChan,
+	})
 	defer s.samplingRequests.Delete(requestID)
 
 	// Send the sampling request via the channel (non-blocking)
@@ -1503,7 +1823,10 @@ func (s *streamableHttpSession) ListRoots(ctx context.Context, request mcp.ListR
 	}
 
 	// Store the pending request
-	s.samplingRequests.Store(requestID, responseChan)
+	s.samplingRequests.Store(requestID, pendingClientRequest{
+		method:   mcp.MethodListRoots,
+		response: responseChan,
+	})
 	defer s.samplingRequests.Delete(requestID)
 
 	// Send the list roots request via the channel (non-blocking)
@@ -1548,17 +1871,35 @@ func (s *streamableHttpSession) RequestElicitation(ctx context.Context, request 
 	}
 
 	// Store the pending request
-	s.samplingRequests.Store(requestID, responseChan)
+	s.samplingRequests.Store(requestID, pendingClientRequest{
+		method:   mcp.MethodElicitationCreate,
+		response: responseChan,
+	})
 	defer s.samplingRequests.Delete(requestID)
 
-	// Send the sampling request via the channel (non-blocking)
-	select {
-	case s.elicitationRequestChan <- elicitationRequest:
-		// Request queued successfully
-	case <-ctx.Done():
-		return nil, ctx.Err()
-	default:
-		return nil, fmt.Errorf("elicitation request queue is full - server overloaded")
+	// Prefer the originating POST's SSE stream when this call comes from an
+	// active POST handler with a streaming response, so a client that only
+	// dispatches server requests from that stream sees the elicitation before
+	// the final response. Fall back to the standalone GET stream otherwise.
+	jsonrpcRequest := mcp.JSONRPCRequest{
+		JSONRPC: "2.0",
+		ID:      mcp.NewRequestId(requestID),
+		Request: mcp.Request{
+			Method: string(mcp.MethodElicitationCreate),
+		},
+		Params: request.Params,
+	}
+	scoped, hasScoped := ctx.Value(requestScopedSSEKey{}).(*requestScopedSSE)
+	if !hasScoped || !scoped.trySend(ctx, jsonrpcRequest) {
+		// Send the elicitation request via the channel (non-blocking)
+		select {
+		case s.elicitationRequestChan <- elicitationRequest:
+			// Request queued successfully
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		default:
+			return nil, fmt.Errorf("elicitation request queue is full - server overloaded")
+		}
 	}
 
 	// Wait for response or context cancellation
