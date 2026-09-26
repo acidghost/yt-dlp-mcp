@@ -27,6 +27,13 @@
       "matchDatasources": ["docker"],
       "matchPackageNames": ["python"],
       "groupName": "python"
+    },
+    {
+      "matchDatasources": ["docker"],
+      "matchPackageNames": ["python"],
+      "matchUpdateTypes": "pinDigest",
+      "matchFileNames": ["/^justfile$/"],
+      "enabled": false
     }
   ]
 }
