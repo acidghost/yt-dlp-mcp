@@ -41,10 +41,6 @@ build-dir:
 run *args: build
     ./build/{{program}}-{{goos}}-{{goarch}} {{args}}
 
-update-requirements:
-    uv pip compile --generate-hashes --python-version=3.14.7 --exclude-newer=P7D \
-        --output-file=requirements.txt requirements.in
-
 vendor:
     go mod tidy
     go mod vendor

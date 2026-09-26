@@ -64,7 +64,7 @@ docker build -t yt-dlp-mcp .
 docker run --rm -p 3000:3000 yt-dlp-mcp
 ```
 
-The runtime image is based on `python:3.14-slim`, installs `yt-dlp[default]`, and copies `deno` for yt-dlp's JavaScript token handling.
+The runtime image reuses the digest-pinned [`yt-dlp-oci`](https://github.com/acidghost/yt-dlp-oci) image, which provides `yt-dlp` and Deno. This repo only builds and adds the MCP server binary.
 
 Published images include max-level provenance, an SBOM, and a keyless cosign signature. Nightly release tarballs include `SHA256SUMS` and GitHub artifact attestations.
 
