@@ -5,13 +5,19 @@
     "local>acidghost/renovate-config:approve(minor)",
     "local>acidghost/renovate-config:approve(patch)"
   ],
+  "pip-compile": {
+    "managerFilePatterns": ["/^requirements\\.txt$/"]
+  },
+  "pip_requirements": {
+    "enabled": false
+  },
   "customManagers": [
     {
       "customType": "regex",
       "managerFilePatterns": [
         "/^justfile$/"
       ],
-      "matchStrings": ["--python-version (?<currentValue>\\S+)"],
+      "matchStrings": ["--python-version=(?<currentValue>\\S+)"],
       "depNameTemplate": "python",
       "datasourceTemplate": "docker"
     }

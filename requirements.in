@@ -6,4 +6,4 @@
 #     just update-requirements
 #
 # Renovate keeps requirements.txt current via the pip_requirements manager.
-yt-dlp[default]==2026.6.9
+yt-dlp[default]==2026.8.19
