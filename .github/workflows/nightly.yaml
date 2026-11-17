@@ -57,15 +57,11 @@ jobs:
         with:
           persist-credentials: false
 
-      - name: Setup Go
-        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
-        with:
-          go-version-file: "go.mod"
-
       - name: Setup mise
         uses: jdx/mise-action@b44d12e7d0d8ee7461bb893e1b1993500433185b # v5.2.7
         with:
           version: 2026.11.5
+          cache: false
 
       - name: Build all platforms
         run: just build-all

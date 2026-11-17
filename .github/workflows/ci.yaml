@@ -18,15 +18,18 @@ jobs:
         with:
           persist-credentials: false
 
-      - name: Setup Go
-        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
-        with:
-          go-version-file: "go.mod"
-
       - name: Setup mise
         uses: jdx/mise-action@b44d12e7d0d8ee7461bb893e1b1993500433185b # v5.2.7
         with:
           version: 2026.11.5
+
+      - name: Setup Go caching
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          # Use mise-installed Go on PATH; do not specify a Go version here.
+          cache-dependency-path: |
+            go.mod
+            go.sum
 
       - name: Run linter
         run: just lint
