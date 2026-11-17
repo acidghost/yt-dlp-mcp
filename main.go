@@ -434,7 +434,7 @@ func (y *ytdlp) run(ctx context.Context, args []string, dir string, timeoutMS in
 		if cmd.Process != nil {
 			_ = syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
 		}
-		<-done
+		<-done //nolint:errcheck // Wait for cleanup; report the timeout instead of the process error.
 		return commandResult{}, fmt.Errorf("yt-dlp timed out after %s", timeout)
 	}
 
