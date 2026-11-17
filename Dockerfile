@@ -11,7 +11,7 @@ ARG BUILD_COMMIT=unknown
 RUN just version="${BUILD_VERSION}" commit_sha="${BUILD_COMMIT}" build \
     && mv build/yt-dlp-mcp-linux-* /usr/local/bin/yt-dlp-mcp
 
-FROM ghcr.io/acidghost/yt-dlp-oci:2026.8.19-0@sha256:62949015c7aae0359c6278ae031b68e1db03a8f853c4983b12960f6702ed468b
+FROM ghcr.io/acidghost/yt-dlp-oci:2026.10.26-0@sha256:3f27a361ecb7810239701b6aa18701179690148601e5fe83636c49d781f01dbb
 COPY --from=builder /usr/local/bin/yt-dlp-mcp /usr/local/bin/yt-dlp-mcp
 EXPOSE 3000
 ENTRYPOINT ["/usr/local/bin/yt-dlp-mcp"]
